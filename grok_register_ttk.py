@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
     "hotmail_max_aliases_per_account": 5,
     "hotmail_poll_interval": 5,
     "hotmail_recent_seconds": 900,
-    "hotmail_imap_hosts": "outlook.office365.com,imap-mail.outlook.com",
+    "hotmail_imap_hosts": "imap-mail.outlook.com,outlook.live.com,outlook.office365.com",
     "hotmail_imap_last_n": 30,
     "hotmail_require_recipient_match": True,
     "hotmail_mail_fetch_mode": "imap",
@@ -1493,39 +1493,35 @@ def cloudmail_get_oai_code(
 # IMAP XOAUTH2 需要 Outlook resource token；Graph Mail.Read token 能刷新成功
 # 但在 IMAP 上会报 "authenticated but not connected"。
 HOTMAIL_IMAP_TOKEN_ENDPOINTS = [
+    # consumers 端点 + .default scope（参考 gr-IMAP-令牌取件例子）
+    # .default 比 IMAP.AccessAsUser.All 返回更宽的权限集，兼容性更好
+    (
+        "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        {"scope": "https://outlook.office.com/.default"},
+    ),
+    # 显式 IMAP scope（部分应用注册需要）
     (
         "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
         {"scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"},
     ),
-    (
-        "https://login.live.com/oauth20_token.srf",
-        {"scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"},
-    ),
-    # Fallback for legacy refresh tokens issued with default scopes.
+    # legacy login.live.com 端点（空 scope，使用 refresh_token 原始授权）
     ("https://login.live.com/oauth20_token.srf", {}),
 ]
 
-# Graph API 需要 Mail.Read scope；与 IMAP scope 互不通用。
+# Graph API 通过 /users/{email}/ 端点访问，MSA token（非 JWT）也可用。
+# 参考 gr-IMAP-令牌取件例子：consumers 端点 + .default scope + /users/{email}/ 端点。
 HOTMAIL_GRAPH_TOKEN_ENDPOINTS = [
+    # consumers 端点 + .default scope（MSA refresh_token 兼容性最好）
     (
         "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-        {
-            "scope": (
-                "offline_access https://graph.microsoft.com/Mail.Read "
-                "https://graph.microsoft.com/User.Read"
-            )
-        },
+        {"scope": "https://graph.microsoft.com/.default"},
     ),
+    # common 端点 + .default scope（备选）
     (
-        "https://login.live.com/oauth20_token.srf",
-        {
-            "scope": (
-                "offline_access https://graph.microsoft.com/Mail.Read "
-                "https://graph.microsoft.com/User.Read"
-            )
-        },
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        {"scope": "https://graph.microsoft.com/.default"},
     ),
-    # 某些 legacy refresh_token 用空 scope 才能刷出可用 access_token
+    # legacy login.live.com 端点（空 scope，使用 refresh_token 原始授权）
     ("https://login.live.com/oauth20_token.srf", {}),
 ]
 
@@ -1800,6 +1796,32 @@ def _hotmail_update_refresh_token_file(email_addr, new_refresh_token, log_callba
                 log_callback(f"[Debug] Hotmail refresh_token 回写失败: {exc}")
 
 
+def _is_jwt_token(token):
+    """检查 access_token 是否为 JWT 格式（JWS Compact Serialization: header.payload.signature）。
+    注意：Graph API 的 /users/{email}/ 端点接受 MSA token（非 JWT），所以此函数仅用于诊断，不用于拦截。"""
+    if not token or not isinstance(token, str):
+        return False
+    return token.count(".") == 2
+
+
+def _hotmail_oauth_post(url, data, timeout=30):
+    """Microsoft OAuth2 token 端点专用 POST。
+
+    参考 outlookEmailPlus 项目和 gr-IMAP-令牌取件例子：使用标准 requests 而非 curl_cffi，
+    避免 curl_cffi 的 TLS 指纹导致 Microsoft 端点返回异常 token 或 TLS 错误。
+    代理失败时自动回退直连。
+    """
+    import requests as std_requests
+
+    proxies = get_proxies()
+    try:
+        return std_requests.post(url, data=data, timeout=timeout, proxies=proxies)
+    except Exception:
+        if proxies:
+            return std_requests.post(url, data=data, timeout=timeout, proxies={})
+        raise
+
+
 def hotmail_refresh_access_token(account, log_callback=None, for_graph=False):
     email_addr = account["email"]
     lock = _hotmail_get_refresh_lock(email_addr)
@@ -1816,13 +1838,16 @@ def hotmail_refresh_access_token(account, log_callback=None, for_graph=False):
                     "grant_type": "refresh_token",
                     **extra,
                 }
-                resp = http_post(url, data=data, timeout=30)
+                # Microsoft OAuth2 端点用标准 requests（非 curl_cffi）
+                resp = _hotmail_oauth_post(url, data=data, timeout=30)
                 try:
                     token_data = resp.json()
                 except Exception:
                     token_data = {}
                 access_token = token_data.get("access_token")
                 if access_token:
+                    # Graph /users/{email}/ 端点接受 MSA token（非 JWT），
+                    # 不再做 JWT 格式预检，直接返回 token 交给 Graph API 验证。
                     new_refresh = token_data.get("refresh_token") or refresh_token
                     if new_refresh and new_refresh != refresh_token:
                         account["refresh_token"] = new_refresh
@@ -1830,8 +1855,10 @@ def hotmail_refresh_access_token(account, log_callback=None, for_graph=False):
                             email_addr, new_refresh, log_callback=log_callback
                         )
                     if log_callback:
+                        granted_scope = token_data.get("scope", "")
                         log_callback(
                             f"[*] Hotmail OAuth2 ({scope_label}) access_token 刷新成功: {email_addr}"
+                            + (f" (granted_scope={granted_scope})" if granted_scope else "")
                         )
                     return access_token
                 last_error = token_data.get("error_description") or token_data.get("error") or resp.text[:200]
@@ -2062,11 +2089,29 @@ def _hotmail_graph_message_body(message):
     return ""
 
 
+def _hotmail_graph_get(url, params=None, headers=None, timeout=45):
+    """Graph API GET 请求专用，使用标准 requests（非 curl_cffi）。
+    与 token 刷新同理，避免 curl_cffi 的 TLS 指纹问题。
+    代理失败时自动回退直连。"""
+    import requests as std_requests
+
+    proxies = get_proxies()
+    try:
+        return std_requests.get(url, params=params, headers=headers, timeout=timeout, proxies=proxies)
+    except Exception:
+        if proxies:
+            return std_requests.get(url, params=params, headers=headers, timeout=timeout, proxies={})
+        raise
+
+
 def _hotmail_graph_get_code(mailbox_email, target_email, access_token, log_callback=None):
     """通过 Microsoft Graph API 拉取 Hotmail/Outlook 邮箱的验证码。
 
-    端点：GET {endpoint}/me/messages
-    使用 $filter 过滤最近 N 秒邮件，$orderby 倒序，$select 只取需要的字段。
+    参考 outlookEmailPlus 项目：
+    - 端点：GET {endpoint}/users/{email}/mailFolders/inbox/messages
+      （用 /users/{email}/ 而非 /me/，MSA token 非 JWT 也可用）
+    - Header Prefer: outlook.body-content-type='text'（让 Graph 返回纯文本正文）
+    - 客户端按 receivedDateTime 过滤（不用 $filter，部分 token 不支持）
     """
     try:
         recent_seconds = int(config.get("hotmail_recent_seconds", 900) or 900)
@@ -2083,11 +2128,10 @@ def _hotmail_graph_get_code(mailbox_email, target_email, access_token, log_callb
     keywords = ["x.ai", "xai", "grok", "verification", "code", "confirm", "验证码", "确认"]
 
     endpoint = _hotmail_graph_get_endpoint()
-    # Graph $filter 使用 UTC ISO 8601；recent_seconds 向前回溯
     from datetime import datetime, timezone, timedelta
 
     filter_after_dt = datetime.now(timezone.utc) - timedelta(seconds=max(60, recent_seconds))
-    filter_after_str = filter_after_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    filter_after_ts = filter_after_dt.timestamp()
 
     params = {
         "$top": str(max(1, last_n)),
@@ -2096,20 +2140,19 @@ def _hotmail_graph_get_code(mailbox_email, target_email, access_token, log_callb
             "id,subject,from,toRecipients,ccRecipients,bccRecipients,body,"
             "uniqueBody,receivedDateTime,internetMessageHeaders"
         ),
-        "$filter": f"receivedDateTime ge {filter_after_str}",
     }
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "ConsistencyLevel": "eventual",
+        "Prefer": "outlook.body-content-type='text'",
     }
-    url = f"{endpoint}/me/messages"
+    # 用 /users/{email}/mailFolders/inbox/messages 端点（MSA token 非 JWT 也可用）
+    url = f"{endpoint}/users/{mailbox_email}/mailFolders/inbox/messages"
 
     if log_callback:
-        log_callback(f"[Debug] Hotmail/Outlook Graph 请求: {mailbox_email} filter>= {filter_after_str}")
-    resp = http_get(url, params=params, headers=headers, timeout=45)
+        log_callback(f"[Debug] Hotmail/Outlook Graph 请求: {mailbox_email} top={last_n}")
+    resp = _hotmail_graph_get(url, params=params, headers=headers, timeout=45)
     if resp.status_code >= 400:
-        # 401/403 通常表示 token scope 不匹配或过期，交给上层重新刷新
         raise Exception(
             f"Graph API 请求失败: HTTP {resp.status_code} {resp.text[:300]}"
         )
@@ -2123,11 +2166,23 @@ def _hotmail_graph_get_code(mailbox_email, target_email, access_token, log_callb
         messages = []
 
     if log_callback and messages:
-        log_callback(f"[Debug] Hotmail/Outlook Graph 命中 {len(messages)} 封近期邮件")
+        log_callback(f"[Debug] Hotmail/Outlook Graph 命中 {len(messages)} 封邮件")
 
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        # 客户端时间过滤
+        received_dt_str = msg.get("receivedDateTime") or ""
+        if received_dt_str:
+            try:
+                dt = datetime.fromisoformat(
+                    received_dt_str.replace("Z", "+00:00")
+                )
+                if dt.timestamp() < filter_after_ts:
+                    continue
+            except Exception:
+                pass
+
         subject = msg.get("subject") or ""
         sender_obj = msg.get("from") or {}
         sender_ea = sender_obj.get("emailAddress") or {}
