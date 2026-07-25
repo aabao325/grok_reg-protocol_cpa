@@ -39,6 +39,7 @@ def mint_and_export(
     probe_chat: bool = False,
     probe_chat_initial_delay_sec: float | None = None,
     probe_chat_retry_delays_sec: Sequence[float] | None = None,
+    probe_required: bool = True,
     browser_timeout_sec: float = 240.0,
     force_standalone: bool = True,
     cookies: Any | None = None,
@@ -235,14 +236,20 @@ def mint_and_export(
             f"error={str(pr.get('error') or '')[:200]}"
         )
         if not pr.get("ok"):
-            result["ok"] = False
-            result["error"] = (
-                f"models probe failed status={pr.get('status')}: "
-                f"{pr.get('error') or 'unknown error'}"
-            )
+            if probe_required:
+                result["ok"] = False
+                result["error"] = (
+                    f"models probe failed status={pr.get('status')}: "
+                    f"{pr.get('error') or 'unknown error'}"
+                )
+            else:
+                log(f"WARNING: models probe failed but writing CPA file anyway (probe_required=False)")
         elif not pr.get("has_grok_45"):
-            result["ok"] = False
-            result["error"] = "token ok but grok-4.5 not listed"
+            if probe_required:
+                result["ok"] = False
+                result["error"] = "token ok but grok-4.5 not listed"
+            else:
+                log("WARNING: grok-4.5 not listed but writing CPA file anyway (probe_required=False)")
         if probe_chat and pr.get("has_grok_45"):
             init_delay = (
                 DEFAULT_CHAT_PROBE_INITIAL_DELAY_SEC
@@ -274,11 +281,23 @@ def mint_and_export(
                 f"model={ch.get('model')} text={ch.get('text')!r}"
             )
             if not ch.get("ok"):
-                result["ok"] = False
-                result["error"] = (
-                    f"chat probe failed after {ch.get('attempts') or '?'} attempt(s): "
-                    f"{ch.get('error') or ch.get('status')}"
-                )
+                # chat probe 失败不阻止写文件：新账号 chat 权限可能延迟激活，
+                # token 本身是有效的。仅在 probe_required=True 时才阻止。
+                if probe_required:
+                    result["ok"] = False
+                    result["error"] = (
+                        f"chat probe failed after {ch.get('attempts') or '?'} attempt(s): "
+                        f"{ch.get('error') or ch.get('status')}"
+                    )
+                else:
+                    result["probe_chat_warning"] = (
+                        f"chat probe failed (token still written): "
+                        f"{ch.get('error') or ch.get('status')}"
+                    )
+                    log(
+                        f"WARNING: chat probe failed but writing CPA file anyway "
+                        f"(probe_required=False): {ch.get('error') or ch.get('status')}"
+                    )
     if not result.get("ok"):
         log("probe failed; not writing CPA auth file")
         return result

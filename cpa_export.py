@@ -145,6 +145,7 @@ def export_cpa_xai_for_account(
     headless = bool(cfg.get("cpa_headless", False))
     probe = bool(cfg.get("cpa_probe_after_write", True))
     probe_chat = bool(cfg.get("cpa_probe_chat", True))
+    probe_required = bool(cfg.get("cpa_probe_required", False))
     probe_chat_initial_delay = cfg.get("cpa_probe_chat_initial_delay_sec", None)
     if probe_chat_initial_delay is not None:
         try:
@@ -223,6 +224,7 @@ def export_cpa_xai_for_account(
         base_url=base_url,
         probe=probe,
         probe_chat=probe_chat,
+        probe_required=probe_required,
         probe_chat_initial_delay_sec=probe_chat_initial_delay,
         probe_chat_retry_delays_sec=probe_chat_retry_delays,
         browser_timeout_sec=timeout,
