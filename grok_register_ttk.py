@@ -67,6 +67,8 @@ DEFAULT_CONFIG = {
     "hotmail_imap_hosts": "outlook.office365.com,imap-mail.outlook.com",
     "hotmail_imap_last_n": 30,
     "hotmail_require_recipient_match": True,
+    "hotmail_mail_fetch_mode": "imap",
+    "hotmail_graph_endpoint": "https://graph.microsoft.com/v1.0",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -1481,13 +1483,16 @@ def cloudmail_get_oai_code(
     raise Exception(f"CloudMail 在 {timeout}s 内未收到验证码邮件")
 
 
-# ──────────────────────── Hotmail / Outlook OAuth2 IMAP ────────────────────────
+# ──────────────────────── Hotmail / Outlook OAuth2 IMAP / Graph ────────────────────────
 # 导入格式兼容 grok-register：邮箱----密码----ClientID----Token
-# 其中 Token 为 Microsoft OAuth2 refresh_token，验证码通过 outlook.office365.com XOAUTH2 IMAP 拉取。
+# 其中 Token 为 Microsoft OAuth2 refresh_token，验证码通过两种方式拉取：
+#   1) IMAP XOAUTH2（outlook.office365.com）—— 默认，scope=IMAP.AccessAsUser.All
+#   2) Microsoft Graph API（graph.microsoft.com/v1.0/me/messages）—— scope=Mail.Read
+# 由 config.hotmail_mail_fetch_mode 控制：imap | graph | auto（auto 优先 graph，失败回退 imap）
 
-HOTMAIL_TOKEN_ENDPOINTS = [
-    # IMAP XOAUTH2 needs an Outlook resource token. Graph Mail.Read tokens can
-    # refresh successfully but then fail at IMAP with "authenticated but not connected".
+# IMAP XOAUTH2 需要 Outlook resource token；Graph Mail.Read token 能刷新成功
+# 但在 IMAP 上会报 "authenticated but not connected"。
+HOTMAIL_IMAP_TOKEN_ENDPOINTS = [
     (
         "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
         {"scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"},
@@ -1496,8 +1501,12 @@ HOTMAIL_TOKEN_ENDPOINTS = [
         "https://login.live.com/oauth20_token.srf",
         {"scope": "offline_access https://outlook.office.com/IMAP.AccessAsUser.All"},
     ),
-    # Fallbacks for existing refresh tokens that were issued with legacy/default scopes.
+    # Fallback for legacy refresh tokens issued with default scopes.
     ("https://login.live.com/oauth20_token.srf", {}),
+]
+
+# Graph API 需要 Mail.Read scope；与 IMAP scope 互不通用。
+HOTMAIL_GRAPH_TOKEN_ENDPOINTS = [
     (
         "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
         {
@@ -1507,7 +1516,21 @@ HOTMAIL_TOKEN_ENDPOINTS = [
             )
         },
     ),
+    (
+        "https://login.live.com/oauth20_token.srf",
+        {
+            "scope": (
+                "offline_access https://graph.microsoft.com/Mail.Read "
+                "https://graph.microsoft.com/User.Read"
+            )
+        },
+    ),
+    # 某些 legacy refresh_token 用空 scope 才能刷出可用 access_token
+    ("https://login.live.com/oauth20_token.srf", {}),
 ]
+
+# 保留旧名以兼容外部引用，指向 IMAP 端点列表
+HOTMAIL_TOKEN_ENDPOINTS = HOTMAIL_IMAP_TOKEN_ENDPOINTS
 
 
 def _config_bool(value, default=False):
@@ -1777,13 +1800,15 @@ def _hotmail_update_refresh_token_file(email_addr, new_refresh_token, log_callba
                 log_callback(f"[Debug] Hotmail refresh_token 回写失败: {exc}")
 
 
-def hotmail_refresh_access_token(account, log_callback=None):
+def hotmail_refresh_access_token(account, log_callback=None, for_graph=False):
     email_addr = account["email"]
     lock = _hotmail_get_refresh_lock(email_addr)
     with lock:
         refresh_token = account.get("refresh_token", "")
+        endpoints = HOTMAIL_GRAPH_TOKEN_ENDPOINTS if for_graph else HOTMAIL_IMAP_TOKEN_ENDPOINTS
+        scope_label = "Graph" if for_graph else "IMAP"
         last_error = None
-        for url, extra in HOTMAIL_TOKEN_ENDPOINTS:
+        for url, extra in endpoints:
             try:
                 data = {
                     "client_id": account["client_id"],
@@ -1805,13 +1830,15 @@ def hotmail_refresh_access_token(account, log_callback=None):
                             email_addr, new_refresh, log_callback=log_callback
                         )
                     if log_callback:
-                        log_callback(f"[*] Hotmail OAuth2 access_token 刷新成功: {email_addr}")
+                        log_callback(
+                            f"[*] Hotmail OAuth2 ({scope_label}) access_token 刷新成功: {email_addr}"
+                        )
                     return access_token
                 last_error = token_data.get("error_description") or token_data.get("error") or resp.text[:200]
             except Exception as exc:
                 last_error = exc
                 continue
-        raise Exception(f"Hotmail OAuth2 refresh 失败: {last_error}")
+        raise Exception(f"Hotmail OAuth2 ({scope_label}) refresh 失败: {last_error}")
 
 
 def _hotmail_decode_header(value):
@@ -1953,6 +1980,218 @@ def _hotmail_imap_get_code(mailbox_email, target_email, access_token, log_callba
             pass
 
 
+def _hotmail_graph_get_endpoint():
+    raw = str(
+        config.get("hotmail_graph_endpoint", "https://graph.microsoft.com/v1.0")
+        or "https://graph.microsoft.com/v1.0"
+    ).strip().rstrip("/")
+    return raw
+
+
+def _hotmail_graph_extract_recipients(message):
+    """从 Graph message 对象中提取所有收件人地址（小写拼接），用于别名匹配。"""
+    import re as re_lib
+
+    blobs = []
+
+    def _add_addr(addr_obj):
+        if not addr_obj:
+            return
+        if isinstance(addr_obj, list):
+            for item in addr_obj:
+                _add_addr(item)
+            return
+        if isinstance(addr_obj, dict):
+            ea = addr_obj.get("emailAddress") or {}
+            addr = ea.get("address")
+            if addr:
+                blobs.append(str(addr).lower())
+            name = ea.get("name")
+            if name:
+                blobs.append(str(name).lower())
+            return
+        blobs.append(str(addr_obj).lower())
+
+    _add_addr(message.get("toRecipients"))
+    _add_addr(message.get("ccRecipients"))
+    _add_addr(message.get("bccRecipients"))
+
+    # internetMessageHeaders 里的 Delivered-To / X-Original-To / Envelope-To
+    headers = message.get("internetMessageHeaders") or []
+    if isinstance(headers, list):
+        for h in headers:
+            if not isinstance(h, dict):
+                continue
+            name = str(h.get("name", "") or "").lower()
+            if name in ("delivered-to", "x-original-to", "original-recipient", "envelope-to"):
+                val = h.get("value")
+                if val:
+                    blobs.append(str(val).lower())
+
+    # 去掉 < > 包裹和多余空白
+    cleaned = []
+    for b in blobs:
+        for piece in re_lib.split(r"[,;\s]+", b):
+            piece = piece.strip().strip("<>").strip()
+            if piece:
+                cleaned.append(piece)
+    return " ".join(cleaned)
+
+
+def _hotmail_graph_message_body(message):
+    """从 Graph message 对象中提取正文（优先 text/plain，回退 HTML 剥标签）。"""
+    import html as html_lib
+    import re as re_lib
+
+    body = message.get("body") or {}
+    content_type = str(body.get("contentType", "") or "").lower()
+    content = body.get("content") or ""
+    if content_type == "text":
+        return content
+    # HTML：剥标签
+    if content:
+        return re_lib.sub(r"\s+", " ", re_lib.sub(r"<[^>]+>", " ", html_lib.unescape(content))).strip()
+    # uniqueBody 兜底
+    unique = message.get("uniqueBody") or {}
+    u_content = unique.get("content") or ""
+    u_type = str(unique.get("contentType", "") or "").lower()
+    if u_type == "text":
+        return u_content
+    if u_content:
+        return re_lib.sub(r"\s+", " ", re_lib.sub(r"<[^>]+>", " ", html_lib.unescape(u_content))).strip()
+    return ""
+
+
+def _hotmail_graph_get_code(mailbox_email, target_email, access_token, log_callback=None):
+    """通过 Microsoft Graph API 拉取 Hotmail/Outlook 邮箱的验证码。
+
+    端点：GET {endpoint}/me/messages
+    使用 $filter 过滤最近 N 秒邮件，$orderby 倒序，$select 只取需要的字段。
+    """
+    try:
+        recent_seconds = int(config.get("hotmail_recent_seconds", 900) or 900)
+    except Exception:
+        recent_seconds = 900
+    try:
+        last_n = int(config.get("hotmail_imap_last_n", 30) or 30)
+    except Exception:
+        last_n = 30
+    require_recipient = _config_bool(
+        config.get("hotmail_require_recipient_match", True), default=True
+    )
+    target_lower = (target_email or "").strip().lower()
+    keywords = ["x.ai", "xai", "grok", "verification", "code", "confirm", "验证码", "确认"]
+
+    endpoint = _hotmail_graph_get_endpoint()
+    # Graph $filter 使用 UTC ISO 8601；recent_seconds 向前回溯
+    from datetime import datetime, timezone, timedelta
+
+    filter_after_dt = datetime.now(timezone.utc) - timedelta(seconds=max(60, recent_seconds))
+    filter_after_str = filter_after_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {
+        "$top": str(max(1, last_n)),
+        "$orderby": "receivedDateTime desc",
+        "$select": (
+            "id,subject,from,toRecipients,ccRecipients,bccRecipients,body,"
+            "uniqueBody,receivedDateTime,internetMessageHeaders"
+        ),
+        "$filter": f"receivedDateTime ge {filter_after_str}",
+    }
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "ConsistencyLevel": "eventual",
+    }
+    url = f"{endpoint}/me/messages"
+
+    if log_callback:
+        log_callback(f"[Debug] Hotmail/Outlook Graph 请求: {mailbox_email} filter>= {filter_after_str}")
+    resp = http_get(url, params=params, headers=headers, timeout=45)
+    if resp.status_code >= 400:
+        # 401/403 通常表示 token scope 不匹配或过期，交给上层重新刷新
+        raise Exception(
+            f"Graph API 请求失败: HTTP {resp.status_code} {resp.text[:300]}"
+        )
+    try:
+        payload = resp.json()
+    except Exception:
+        raise Exception(f"Graph API 返回非 JSON: {resp.text[:200]}")
+
+    messages = payload.get("value") or []
+    if not isinstance(messages, list):
+        messages = []
+
+    if log_callback and messages:
+        log_callback(f"[Debug] Hotmail/Outlook Graph 命中 {len(messages)} 封近期邮件")
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        subject = msg.get("subject") or ""
+        sender_obj = msg.get("from") or {}
+        sender_ea = sender_obj.get("emailAddress") or {}
+        sender = sender_ea.get("address") or ""
+        recipient_blob = _hotmail_graph_extract_recipients(msg)
+        recipient_matched = not target_lower or target_lower in recipient_blob
+        if require_recipient and not recipient_matched:
+            continue
+
+        body = _hotmail_graph_message_body(msg)
+        combined = f"{subject}\n{sender}\n{recipient_blob}\n{body}"
+        combined_lower = combined.lower()
+        if not any(kw in combined_lower for kw in keywords):
+            continue
+        code = extract_verification_code(combined, subject)
+        if code:
+            if log_callback:
+                log_callback(f"[*] Hotmail/Outlook Graph 从邮件中提取到验证码: {code}")
+            return code
+    return None
+
+
+def _hotmail_get_fetch_mode():
+    raw = str(config.get("hotmail_mail_fetch_mode", "imap") or "imap").strip().lower()
+    if raw not in ("imap", "graph", "auto"):
+        return "imap"
+    return raw
+
+
+def _hotmail_fetch_via_imap(account, mailbox_email, target_email, access_token, log_callback=None):
+    """走 IMAP 通道拉取验证码，成功连接的 host 未取到码时返回 None。"""
+    code = None
+    host_errors = []
+    for imap_host in _hotmail_get_imap_hosts():
+        try:
+            code = _hotmail_imap_get_code(
+                mailbox_email,
+                target_email,
+                access_token,
+                log_callback=log_callback,
+                host=imap_host,
+            )
+            # 成功连接但本轮未找到码，不必再换同邮箱另一个 host 重扫。
+            break
+        except Exception as host_exc:
+            host_errors.append(f"{imap_host}: {host_exc}")
+            if log_callback:
+                log_callback(f"[Debug] Hotmail/Outlook IMAP host 失败: {imap_host}: {host_exc}")
+            continue
+    if code is None and host_errors and len(host_errors) >= len(_hotmail_get_imap_hosts()):
+        raise Exception("; ".join(host_errors))
+    return code
+
+
+def _hotmail_fetch_via_graph(account, mailbox_email, target_email, access_token, log_callback=None):
+    """走 Graph API 通道拉取验证码，未取到码时返回 None。"""
+    return _hotmail_graph_get_code(
+        mailbox_email,
+        target_email,
+        access_token,
+        log_callback=log_callback,
+    )
+
+
 def hotmail_get_oai_code(
     dev_token,
     email,
@@ -1973,7 +2212,12 @@ def hotmail_get_oai_code(
         configured_interval = 5.0
     current_interval = max(1.0, configured_interval or float(poll_interval or 3))
     deadline = time.time() + timeout
-    access_token = None
+    fetch_mode = _hotmail_get_fetch_mode()
+    # Graph 与 IMAP 使用不同 scope 的 access_token，需要分别缓存
+    imap_access_token = None
+    graph_access_token = None
+    # auto 模式下 Graph 连续失败次数；超过阈值后本轮直接跳到 IMAP，避免每次都等 Graph 超时
+    graph_fail_streak = 0
     next_resend_at = time.time() + 60
 
     while time.time() < deadline:
@@ -1988,35 +2232,59 @@ def hotmail_get_oai_code(
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 60
         try:
-            if not access_token:
-                access_token = hotmail_refresh_access_token(account, log_callback=log_callback)
             code = None
-            host_errors = []
-            for imap_host in _hotmail_get_imap_hosts():
-                try:
-                    code = _hotmail_imap_get_code(
-                        mailbox_email,
-                        email,
-                        access_token,
-                        log_callback=log_callback,
-                        host=imap_host,
+
+            # 1) Graph 通道
+            if fetch_mode in ("graph", "auto"):
+                # auto 模式下若 Graph 连续失败，直接走 IMAP
+                skip_graph = fetch_mode == "auto" and graph_fail_streak >= 3
+                if not skip_graph:
+                    if not graph_access_token:
+                        graph_access_token = hotmail_refresh_access_token(
+                            account, log_callback=log_callback, for_graph=True
+                        )
+                    try:
+                        code = _hotmail_fetch_via_graph(
+                            account, mailbox_email, email, graph_access_token, log_callback=log_callback
+                        )
+                        graph_fail_streak = 0
+                    except Exception as graph_exc:
+                        graph_fail_streak += 1
+                        graph_access_token = None
+                        if log_callback:
+                            log_callback(
+                                f"[Debug] Hotmail/Outlook Graph 拉取失败 (连续 {graph_fail_streak} 次): {graph_exc}"
+                            )
+                        if fetch_mode == "graph":
+                            # 纯 Graph 模式下失败直接抛出，触发上层重试
+                            raise
+                        # auto 模式下静默回退到 IMAP
+
+            # 2) IMAP 通道
+            if code is None and fetch_mode in ("imap", "auto"):
+                if not imap_access_token:
+                    imap_access_token = hotmail_refresh_access_token(
+                        account, log_callback=log_callback, for_graph=False
                     )
-                    # 成功连接但本轮未找到码，不必再换同邮箱另一个 host 重扫。
-                    break
-                except Exception as host_exc:
-                    host_errors.append(f"{imap_host}: {host_exc}")
+                try:
+                    code = _hotmail_fetch_via_imap(
+                        account, mailbox_email, email, imap_access_token, log_callback=log_callback
+                    )
+                except Exception as imap_exc:
+                    imap_access_token = None
+                    if fetch_mode == "imap":
+                        raise
                     if log_callback:
-                        log_callback(f"[Debug] Hotmail/Outlook IMAP host 失败: {imap_host}: {host_exc}")
-                    continue
-            if code is None and host_errors and len(host_errors) >= len(_hotmail_get_imap_hosts()):
-                raise Exception("; ".join(host_errors))
+                        log_callback(f"[Debug] Hotmail/Outlook IMAP 回退失败: {imap_exc}")
+
             if code:
                 return code
             if log_callback:
                 log_callback(f"[Debug] Hotmail/Outlook 本轮未找到验证码: {email}")
         except Exception as exc:
             # OAuth/IMAP 临时失败时下一轮重新 refresh access_token。
-            access_token = None
+            imap_access_token = None
+            graph_access_token = None
             if log_callback:
                 log_callback(f"[Debug] Hotmail/Outlook 拉取验证码失败: {exc}")
         sleep_with_cancel(current_interval, cancel_callback)

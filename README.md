@@ -5,7 +5,7 @@
 ## 核心特性
 
 1. **多邮箱支持**  
-   支持 Hotmail/Outlook（四段凭证+XOAUTH2 IMAP）、CloudMail、Cloudflare、DuckMail、YYDS 等主流临时邮箱服务。
+   支持 Hotmail/Outlook（四段凭证+XOAUTH2 IMAP / Microsoft Graph API）、CloudMail、Cloudflare、DuckMail、YYDS 等主流临时邮箱服务。
 
 2. **协议优先的 CPA 导出**  
    注册拿到 SSO 后，优先用 **纯 HTTP PKCE authorization-code flow**（`curl_cffi` + `sso` cookie）铸造 CPA 用的 `xai-*.json`；协议失败默认不再回退旧 Device Flow，避免产出 `/models` 可用但 chat 403 的坏 token。
@@ -130,7 +130,7 @@ cp mail_credentials.example.txt mail_credentials.txt
 | 邮箱 | Hotmail / Outlook 主邮箱 |
 | 密码 | 邮箱登录密码（注册机侧保留；IMAP 走 OAuth） |
 | ClientID | 微软应用（Azure AD 应用）Client ID |
-| Token | Microsoft OAuth2 **refresh_token**（XOAUTH2 IMAP 用） |
+| Token | Microsoft OAuth2 **refresh_token**（XOAUTH2 IMAP / Graph API 用） |
 
 示例：
 
@@ -141,7 +141,10 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 运行时行为摘要：
 
 - 默认先用原邮箱，后续用随机 plus alias（如 `name+k8s2p9qa@domain`）
-- 经 `outlook.office365.com`（可回退 `imap-mail.outlook.com`）XOAUTH2 IMAP 拉验证码
+- 验证码拉取通道由 `hotmail_mail_fetch_mode` 控制：
+  - `imap`（默认）：经 `outlook.office365.com`（可回退 `imap-mail.outlook.com`）XOAUTH2 IMAP，scope=`IMAP.AccessAsUser.All`
+  - `graph`：经 Microsoft Graph API `/me/messages`，scope=`Mail.Read`
+  - `auto`：优先 Graph，失败连续 3 次后回退 IMAP（两个通道使用各自 scope 的 access_token）
 - refresh_token 若轮换会**自动回写** `mail_credentials.txt`
 - 成功 / 失败 / 占用中的 alias 会参与去重与 `hotmail_max_aliases_per_account` 计数
 
