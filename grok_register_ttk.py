@@ -108,6 +108,8 @@ def mark_used(email: str, password: str = ""):
 
 def mark_error(email: str, password: str = "", reason: str = ""):
     """记录失败邮箱及原因，避免重试烂邮箱。"""
+    # reason 可能是多行异常文本；压成单行，否则后续行会被账本解析成邮箱
+    reason = " ".join(str(reason or "").split())
     with _email_track_lock:
         with open(_EMAILS_ERROR_FILE, "a", encoding="utf-8") as f:
             f.write(f"{email}----{password}----{reason}\n")
@@ -1648,8 +1650,10 @@ def _hotmail_iter_tracked_emails():
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
+                    if "----" not in line:
+                        continue
                     email_addr = line.split("----", 1)[0].strip()
-                    if email_addr:
+                    if email_addr and "@" in email_addr:
                         yield email_addr
         except Exception:
             continue
@@ -2786,7 +2790,7 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
         return False, f"寮傚父: {str(e)}"
 
 
-SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com&return_to=%2F%3Freferrer%3Dwebsite"
 
 _thread_ctx = threading.local()
 

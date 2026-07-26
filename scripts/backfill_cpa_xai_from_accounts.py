@@ -156,6 +156,7 @@ def main() -> int:
     if not args.cpa_dir:
         # 默认推送到本机 CLIProxyAPI 账号目录
         args.cpa_dir = str(Path.home() / ".cli-proxy-api")
+    args.cpa_dir = str(Path(args.cpa_dir).expanduser())
     print(f"cpa_hotload_dir={args.cpa_dir}", flush=True)
 
     # Protocol flow: CLI > config cpa_protocol_flow > pkce

@@ -56,6 +56,53 @@ def _session(proxy: str | None):
     return cf_requests.Session(**kwargs)
 
 
+# curl/TLS hiccups seen in practice: transport died before any response arrived,
+# so replaying the request is safe.
+_TRANSIENT_MARKERS = (
+    "tls connect error",
+    "connection closed abruptly",
+    "connection reset",
+    "recv failure",
+    "send failure",
+    "empty reply from server",
+    "operation timed out",
+    "timed out",
+    "could not resolve",
+    "failed to connect",
+    "connection refused",
+    "proxy connect",
+)
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF = 1.5
+
+
+def _is_transient(exc: Exception) -> bool:
+    text = f"{exc}".lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _request(session: Any, method: str, url: str, *, log: LogFn | None = None, **kwargs: Any):
+    """session.get/post with retry on transport-level failures.
+
+    Only network exceptions are retried; an HTTP response of any status is
+    returned to the caller untouched.
+    """
+    log = log or _noop_log
+    last: Exception | None = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            return getattr(session, method)(url, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - curl_cffi raises library-specific errors
+            last = exc
+            if attempt >= _RETRY_ATTEMPTS or not _is_transient(exc):
+                raise
+            delay = _RETRY_BACKOFF * attempt
+            log(f"pkce {method.upper()} {urlparse(url).path or url} transient error ({exc}); retry {attempt}/{_RETRY_ATTEMPTS - 1} in {delay:.1f}s")
+            time.sleep(delay)
+    raise last if last else PKCEMintError("request failed")
+
+
 def _set_sso_cookie(session: Any, sso_cookie: str) -> None:
     sso_cookie = (sso_cookie or "").strip()
     if not sso_cookie:
@@ -151,10 +198,13 @@ def _code_from_url(url: str, state: str) -> str:
     return code
 
 
-def _create_cookie_setter_link(session: Any, success_url: str) -> str:
+def _create_cookie_setter_link(session: Any, success_url: str, log: LogFn | None = None) -> str:
     msg = grpcweb.encode_string(1, success_url) + grpcweb.encode_string(2, f"{ACCOUNTS_ORIGIN}/sign-in")
-    resp = session.post(
+    resp = _request(
+        session,
+        "post",
         CREATE_COOKIE_SETTER_RPC,
+        log=log,
         headers=_grpc_headers(f"{ACCOUNTS_ORIGIN}/sign-in?redirect=oauth2-provider"),
         data=grpcweb.frame_request(msg),
         timeout=45,
@@ -188,6 +238,7 @@ def _submit_consent(
     state: str,
     code_challenge: str,
     nonce: str,
+    log: LogFn | None = None,
 ) -> str:
     """Submit the OAuth2 consent via traditional form POST.
 
@@ -235,7 +286,10 @@ def _submit_consent(
         "sec-fetch-mode": "cors",
         "sec-fetch-dest": "empty",
     }
-    resp = session.post(action_url, data=fields, headers=headers, allow_redirects=False, timeout=45)
+    resp = _request(
+        session, "post", action_url, log=log,
+        data=fields, headers=headers, allow_redirects=False, timeout=45,
+    )
 
     loc = resp.headers.get("location") or resp.headers.get("Location") or ""
     if "code=" in loc:
@@ -262,9 +316,13 @@ def _exchange_code_for_token(
     verifier: str,
     redirect_uri: str,
     client_id: str,
+    log: LogFn | None = None,
 ) -> dict[str, Any]:
-    resp = session.post(
+    resp = _request(
+        session,
+        "post",
         TOKEN_ENDPOINT,
+        log=log,
         data={
             "grant_type": "authorization_code",
             "client_id": client_id,
@@ -337,8 +395,8 @@ def mint_with_sso_pkce(
 
     if cancel and cancel():
         raise PKCEMintError("cancelled")
-    session.get(auth_url, allow_redirects=False, timeout=timeout)
-    setter = _create_cookie_setter_link(session, consent_url)
+    _request(session, "get", auth_url, log=log, allow_redirects=False, timeout=timeout)
+    setter = _create_cookie_setter_link(session, consent_url, log=log)
     log("pkce cookie-setter link ok")
 
     current = setter
@@ -350,7 +408,7 @@ def mint_with_sso_pkce(
             break
         if "set-cookie" not in current:
             break
-        resp = session.get(current, allow_redirects=False, timeout=timeout)
+        resp = _request(session, "get", current, log=log, allow_redirects=False, timeout=timeout)
         loc = resp.headers.get("location") or resp.headers.get("Location") or ""
         log(f"pkce set-cookie HTTP {resp.status_code}")
         if not loc:
@@ -362,7 +420,7 @@ def mint_with_sso_pkce(
     if "code" not in locals():
         if "consent" not in current:
             raise PKCEMintError(f"cookie-setter did not reach consent/code: {current[:180]}")
-        page = session.get(current, allow_redirects=False, timeout=timeout)
+        page = _request(session, "get", current, log=log, allow_redirects=False, timeout=timeout)
         loc = page.headers.get("location") or page.headers.get("Location") or ""
         if loc and "code=" in loc:
             code = _code_from_url(urljoin(current, loc), state)
@@ -377,11 +435,13 @@ def mint_with_sso_pkce(
                 state=state,
                 code_challenge=challenge,
                 nonce=nonce,
+                log=log,
             )
     log(f"pkce authorization code ok{f' email={email}' if email else ''}")
 
     token = _exchange_code_for_token(
         session,
+        log=log,
         code=code,
         verifier=verifier,
         redirect_uri=redirect_uri,
