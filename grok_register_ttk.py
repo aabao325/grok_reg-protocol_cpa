@@ -791,7 +791,7 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
             if log_callback:
                 log_callback(f"[Debug] grok2api /accounts/web/import HTTP {resp.status_code}: {body}")
             return False
-        # 解析 SSE：event: <name>\n data: <json>；以 complete/error 为终止事件
+        # 解析 SSE：event: <name>\n data: <json>；以 complete/error 的 data 行作为终止
         cur_event = ""
         complete_data = None
         err_msg = None
@@ -801,20 +801,22 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
             line = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
             if line.startswith("event:"):
                 cur_event = line[6:].strip()
-            elif line.startswith("data:"):
-                payload_str = line[5:].strip()
-                if cur_event == "complete":
-                    try:
-                        complete_data = json.loads(payload_str) if payload_str else None
-                    except Exception:
-                        complete_data = None
-                elif cur_event == "error":
-                    try:
-                        err_payload = json.loads(payload_str) if payload_str else {}
-                        err_msg = str(err_payload.get("message") or err_payload.get("code") or payload_str)
-                    except Exception:
-                        err_msg = payload_str
-            if cur_event in ("complete", "error"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload_str = line[5:].strip()
+            if cur_event == "complete":
+                try:
+                    complete_data = json.loads(payload_str) if payload_str else {}
+                except Exception:
+                    complete_data = {}
+                break
+            if cur_event == "error":
+                try:
+                    err_payload = json.loads(payload_str) if payload_str else {}
+                    err_msg = str(err_payload.get("message") or err_payload.get("code") or payload_str)
+                except Exception:
+                    err_msg = payload_str
                 break
         if err_msg:
             if log_callback:
