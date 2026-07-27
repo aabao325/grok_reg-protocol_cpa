@@ -523,6 +523,22 @@ def main() -> int:
         action="store_true",
         help="注册浏览器强制有头模式，覆盖 config.register_headless",
     )
+    parser.add_argument(
+        "--browser-backend",
+        choices=["chromium", "bitbrowser"],
+        default=None,
+        help="浏览器后端：chromium=本机 Chrome（默认）；bitbrowser=比特浏览器 Local API",
+    )
+    parser.add_argument(
+        "--bitbrowser-id",
+        default=None,
+        help="BitBrowser 窗口 id（可覆盖 config.bitbrowser_browser_id）",
+    )
+    parser.add_argument(
+        "--bitbrowser-name",
+        default=None,
+        help="BitBrowser 窗口名称（可覆盖 config.bitbrowser_name）",
+    )
     args = parser.parse_args()
 
     reg.load_config()
@@ -534,6 +550,17 @@ def main() -> int:
         cfg0["register_headless"] = True
     elif args.headed_register:
         cfg0["register_headless"] = False
+    if args.browser_backend:
+        cfg0["browser_backend"] = args.browser_backend
+    if args.bitbrowser_id:
+        cfg0["bitbrowser_browser_id"] = args.bitbrowser_id
+    if args.bitbrowser_name:
+        cfg0["bitbrowser_name"] = args.bitbrowser_name
+    # keep module-global config in sync for create_managed_browser
+    try:
+        reg.config = cfg0
+    except Exception:
+        pass
     threads = max(1, min(args.threads, 10))
     fast = bool(args.fast) and not bool(args.no_fast)
 
@@ -573,7 +600,8 @@ def main() -> int:
         print(
             f"[*] 配置加载完成，额外新注册 {args.extra} 个（当前已有 {done_count} → 目标 {target_total}），"
             f"注册线程={threads} mint_workers={mint_workers} mint_queue_max={mint_qmax} "
-            f"fast={fast} register_headless={bool(cfg0.get('register_headless', False))}",
+            f"fast={fast} register_headless={bool(cfg0.get('register_headless', False))} "
+            f"browser_backend={cfg0.get('browser_backend', 'chromium')}",
             flush=True,
         )
         args.count = target_total
@@ -610,7 +638,14 @@ def main() -> int:
     log_thread.start()
 
     try:
-        reg.TabPool.init(reg.create_browser_options, log_callback=lambda m: log(0, m))
+        def _browser_factory():
+            return reg.create_managed_browser(log_callback=lambda m: log(0, m))
+
+        reg.TabPool.init(
+            reg.create_browser_options,
+            log_callback=lambda m: log(0, m),
+            browser_factory=_browser_factory,
+        )
     except Exception as exc:
         print(f"[!] 浏览器初始化失败: {exc}", flush=True)
         return 1

@@ -1,6 +1,6 @@
 # grok_reg-protocol_cpa
 
-基于 **Chromium + DrissionPage + turnstilePatch** 的免费 Grok 账号注册机。
+基于 **Chromium / BitBrowser + DrissionPage + turnstilePatch** 的免费 Grok 账号注册机。
 
 ## 核心特性
 
@@ -9,6 +9,9 @@
 
 2. **协议优先的 CPA 导出**  
    注册拿到 SSO 后，优先用 **纯 HTTP PKCE authorization-code flow**（`curl_cffi` + `sso` cookie）铸造 CPA 用的 `xai-*.json`；协议失败默认不再回退旧 Device Flow，避免产出 `/models` 可用但 chat 403 的坏 token。
+
+3. **可选 BitBrowser（比特浏览器）**  
+   `browser_backend=bitbrowser` 时通过 Local API 打开指纹窗口，再用 DrissionPage 接管 `http` 调试端口；默认仍为本地 Chromium。
 
 ## 产物说明
 
@@ -290,6 +293,42 @@ cpa_proxy  >  proxy  >  环境变量 https_proxy/http_proxy
 
 配置优先于 shell 里的 `https_proxy`，避免「config 写了 7890 却被环境变量盖掉」。
 
+### BitBrowser（比特浏览器）
+
+默认 `browser_backend=chromium`（本机 Chrome）。若要用指纹浏览器：
+
+1. 启动比特浏览器，确认 Local API（默认 `http://127.0.0.1:54345`）
+2. 在 `config.json` 设置：
+
+```json
+{
+  "browser_backend": "bitbrowser",
+  "bitbrowser_api": "http://127.0.0.1:54345",
+  "bitbrowser_browser_id": "你的窗口ID",
+  "bitbrowser_name": "grok",
+  "bitbrowser_auto_create": true
+}
+```
+
+或 CLI：
+
+```bash
+uv run python -u register_cli.py --extra 1 --threads 1 \
+  --browser-backend bitbrowser \
+  --bitbrowser-id 7175d9fa024c4af495c5eb74dd69749f
+```
+
+| 字段 | 说明 |
+|------|------|
+| `bitbrowser_browser_id` | 单窗口 id（`threads=1` 够用） |
+| `bitbrowser_browser_ids` | 多线程窗口池，一线程一窗 |
+| `bitbrowser_name` | 按名称查找；找不到可 `auto_create` |
+| `bitbrowser_auto_create` | 无 id 时自动新建临时窗 |
+| `bitbrowser_delete_on_release` | 临时窗 release 时是否删除 |
+| `bitbrowser_load_turnstile_patch` | open 时注入本仓库 `turnstilePatch` |
+
+> 多线程时不要共用同一个 `bitbrowser_browser_id`；请配置窗口池或开启自动创建。
+
 ### 与 CPA 相关的关键项（摘要）
 
 | 字段 | 含义 | 建议 |
@@ -432,6 +471,9 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 | `--accounts-file` | 账本路径 | `./accounts_cli.txt` |
 | `--headless-register` | 注册浏览器使用无头模式 | 有头 |
 | `--headed-register` | 注册浏览器强制有头模式 | - |
+| `--browser-backend` | `chromium` 或 `bitbrowser` | config / chromium |
+| `--bitbrowser-id` | BitBrowser 窗口 id | config |
+| `--bitbrowser-name` | BitBrowser 窗口名称 | config |
 
 ### CPA Mint 参数
 
@@ -492,6 +534,8 @@ uv run python grok_register_ttk.py
 grok_reg-protocol_cpa/
   register_cli.py              # CLI 批量注册
   grok_register_ttk.py         # 浏览器注册核心 + Hotmail 等
+  bitbrowser.py                # BitBrowser Local API + DrissionPage 接管
+  tab_pool.py                  # 每线程浏览器生命周期
   cpa_export.py                # 成功 hook
   cpa_xai/
     pkce_mint.py               # SSO 纯 HTTP PKCE authorization-code（协议优先）

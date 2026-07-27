@@ -63,6 +63,8 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 grok_reg-protocol_cpa/
 ├── register_cli.py           # CLI 批量注册入口
 ├── grok_register_ttk.py      # 浏览器注册核心（含 Hotmail/Outlook 邮箱）
+├── bitbrowser.py             # BitBrowser Local API 客户端 + DrissionPage 接管
+├── tab_pool.py               # 每线程浏览器生命周期（支持 bitbrowser release）
 ├── cpa_export.py             # 注册成功后的 CPA 导出 hook
 ├── cpa_xai/                  # OIDC/CPA 铸造模块
 │   ├── pkce_mint.py          # 纯 HTTP PKCE authorization-code（协议优先）
@@ -100,6 +102,10 @@ grok_reg-protocol_cpa/
 |------|------|
 | `email_provider` | 邮箱类型：`hotmail`、`cloudmail`、`cloudflare` 等 |
 | `hotmail_accounts_file` | Hotmail 凭证文件路径 |
+| `browser_backend` | `chromium`（默认）或 `bitbrowser` |
+| `bitbrowser_api` | 比特浏览器 Local API，默认 `http://127.0.0.1:54345` |
+| `bitbrowser_browser_id` / `bitbrowser_browser_ids` | 固定窗口 id / 窗口池 |
+| `bitbrowser_name` | 按名称查找窗口；可配合 `bitbrowser_auto_create` |
 | `cpa_export_enabled` | 是否启用 CPA 导出（默认 `true`） |
 | `cpa_prefer_protocol` | 是否优先协议 mint（默认 `true`） |
 | `cpa_protocol_flow` | 协议 mint 流程：`pkce`（默认推荐）或 `device`（旧 Device Flow） |

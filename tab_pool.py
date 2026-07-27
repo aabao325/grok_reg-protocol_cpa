@@ -2,7 +2,7 @@
 """TabPool — per-thread Chromium with proper lifecycle.
 
 Interface:
-    TabPool.init(options_factory) → save options factory (no browser yet)
+    TabPool.init(options_factory, browser_factory=...) → save factories (no browser yet)
     TabPool.get_tab()             → get/create current thread browser tab
     TabPool.clear_session()       → wipe cookies/storage; keep process warm
     TabPool.release_tab()         → quit current thread browser + drop registry
@@ -12,18 +12,21 @@ Notes:
     - One Chromium per worker thread (cookie isolation).
     - Prefer clear_session() between accounts; release_tab() only on errors / GC.
     - _all_browsers is pruned on release to avoid zombie list growth.
+    - browser_factory (optional) may return a Chromium already attached to BitBrowser;
+      release then goes through bitbrowser.release_attached instead of quit(del_data=True).
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Callable
 
 
 class TabPool:
     """Per-thread Chromium instance manager."""
 
     _options_factory = None
+    _browser_factory: Callable[[], Any] | None = None
     _options_lock = threading.Lock()
     _thread_local = threading.local()
     _all_browsers: list[Any] = []
@@ -32,27 +35,43 @@ class TabPool:
     # ── public ──
 
     @classmethod
-    def init(cls, browser_options_or_factory, log_callback=None):
-        """Save options object or factory. Callable → fresh options each create."""
+    def init(cls, browser_options_or_factory, log_callback=None, browser_factory=None):
+        """Save options object/factory and optional full browser factory.
+
+        browser_factory: () -> Chromium
+            When set, used instead of Chromium(options_factory()).
+        """
         with cls._options_lock:
-            if callable(browser_options_or_factory):
+            if browser_factory is not None and not callable(browser_factory):
+                raise TypeError("browser_factory must be callable")
+            cls._browser_factory = browser_factory
+            if browser_options_or_factory is None:
+                cls._options_factory = None
+            elif callable(browser_options_or_factory):
                 cls._options_factory = browser_options_or_factory
             else:
                 # Shared options object: auto_port will NOT re-allocate.
                 cls._options_factory = lambda: browser_options_or_factory
         if log_callback:
-            log_callback("[*] TabPool 已初始化浏览器选项模板")
+            backend = "custom" if browser_factory else "chromium-options"
+            log_callback(f"[*] TabPool 已初始化浏览器工厂 ({backend})")
 
     @classmethod
     def _create_browser(cls):
         from DrissionPage import Chromium
 
         with cls._options_lock:
-            factory = cls._options_factory
-        if factory is None:
-            return None
-        options = factory()
-        browser = Chromium(options)
+            browser_factory = cls._browser_factory
+            options_factory = cls._options_factory
+
+        if browser_factory is not None:
+            browser = browser_factory()
+        else:
+            if options_factory is None:
+                return None
+            options = options_factory()
+            browser = Chromium(options)
+
         with cls._all_browsers_lock:
             cls._all_browsers.append(browser)
         return browser
@@ -66,6 +85,32 @@ class TabPool:
                 cls._all_browsers = [b for b in cls._all_browsers if b is not browser]
             except Exception:
                 pass
+
+    @classmethod
+    def _dispose_browser(cls, browser, log_callback=None) -> None:
+        """Release one browser instance (BitBrowser-aware)."""
+        if browser is None:
+            return
+        if getattr(browser, "_bitbrowser_id", None) or getattr(browser, "_bitbrowser_meta", None):
+            try:
+                from bitbrowser import release_attached
+
+                release_attached(browser, log=log_callback)
+            except Exception:
+                try:
+                    browser.quit()
+                except Exception:
+                    pass
+            return
+        try:
+            browser.quit(del_data=True)
+        except TypeError:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     @classmethod
     def get_tab(cls, url=None):
@@ -188,19 +233,11 @@ class TabPool:
         return int(getattr(cls._thread_local, "served", 0) or 0)
 
     @classmethod
-    def release_tab(cls):
+    def release_tab(cls, log_callback=None):
         """Quit current thread Chromium and unregister it."""
         browser = getattr(cls._thread_local, "browser", None)
         if browser is not None:
-            try:
-                browser.quit(del_data=True)
-            except TypeError:
-                try:
-                    browser.quit()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+            cls._dispose_browser(browser, log_callback=log_callback)
             cls._unregister(browser)
         cls._thread_local.browser = None
         cls._thread_local.tab = None
@@ -213,22 +250,14 @@ class TabPool:
         return cls.get_tab()
 
     @classmethod
-    def shutdown(cls):
+    def shutdown(cls, log_callback=None):
         """Quit every browser we still track."""
-        cls.release_tab()
+        cls.release_tab(log_callback=log_callback)
         with cls._all_browsers_lock:
             browsers = list(cls._all_browsers)
             cls._all_browsers.clear()
         for b in browsers:
-            try:
-                b.quit(del_data=True)
-            except TypeError:
-                try:
-                    b.quit()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+            cls._dispose_browser(b, log_callback=log_callback)
 
     @classmethod
     def live_count(cls) -> int:

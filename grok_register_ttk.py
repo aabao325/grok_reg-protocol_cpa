@@ -39,6 +39,19 @@ DEFAULT_CONFIG = {
     "cloudflare_path_messages": "/api/parsed_mails",
     "proxy": "http://127.0.0.1:7890",
     "register_headless": False,
+    # browser_backend: chromium（默认本机 Chrome）| bitbrowser（比特浏览器 Local API）
+    "browser_backend": "chromium",
+    "bitbrowser_api": "http://127.0.0.1:54345",
+    "bitbrowser_browser_id": "",
+    "bitbrowser_browser_ids": [],
+    "bitbrowser_name": "",
+    "bitbrowser_auto_create": True,
+    "bitbrowser_delete_on_release": True,
+    "bitbrowser_load_extensions": True,
+    "bitbrowser_load_turnstile_patch": True,
+    "bitbrowser_sync_proxy": False,
+    "bitbrowser_timeout": 60,
+    "bitbrowser_args": [],
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -838,6 +851,33 @@ def create_browser_options():
         except Exception as e:
             print(f"  [proxy] set browser proxy failed: {e}")
     return options
+
+
+def browser_backend_name() -> str:
+    raw = str((config or {}).get("browser_backend") or "chromium").strip().lower()
+    if raw in {"bitbrowser", "bit", "bb", "比特", "比特浏览器"}:
+        return "bitbrowser"
+    return "chromium"
+
+
+def create_managed_browser(log_callback=None):
+    """Create a browser for TabPool: local Chromium or BitBrowser attach."""
+    backend = browser_backend_name()
+    if backend == "bitbrowser":
+        from bitbrowser import open_and_attach
+
+        ext = EXTENSION_PATH if os.path.exists(EXTENSION_PATH) else None
+
+        def _log(msg):
+            if log_callback:
+                log_callback(msg)
+            else:
+                print(msg)
+
+        browser, _meta = open_and_attach(config, extension_path=ext, log=_log)
+        return browser
+
+    return Chromium(create_browser_options())
 
 
 def _build_request_kwargs(**kwargs):
@@ -2817,28 +2857,40 @@ def _set_page(value):
 
 def start_browser(log_callback=None):
     last_exc = None
+    backend = browser_backend_name()
     for attempt in range(1, 5):
         try:
-            TabPool.init(create_browser_options, log_callback=log_callback)
+            # Capture log_callback for BitBrowser factory via closure.
+            def _browser_factory(log_callback=log_callback):
+                return create_managed_browser(log_callback=log_callback)
+
+            TabPool.init(
+                create_browser_options,
+                log_callback=log_callback,
+                browser_factory=_browser_factory,
+            )
             page = TabPool.get_tab()
-            if log_callback and attempt > 1:
-                log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
+            if log_callback:
+                if attempt > 1:
+                    log_callback(f"[*] 浏览器第 {attempt} 次启动成功 ({backend})")
+                else:
+                    log_callback(f"[*] 浏览器已启动 backend={backend}")
             return TabPool.get_browser(), page
         except Exception as exc:
             last_exc = exc
             if log_callback:
-                log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+                log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次, backend={backend}): {exc}")
             # 每线程独立浏览器，shutdown 只影响当前线程
             try:
-                TabPool.release_tab()
+                TabPool.release_tab(log_callback=log_callback)
             except Exception:
                 pass
             human_sleep(min(1.5 * attempt, 4))
-    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
+    raise Exception(f"浏览器启动失败，已重试4次 (backend={backend}): {last_exc}")
 
 
 def stop_browser():
-    """Quit current-thread Chromium (full process exit + del_data)."""
+    """Quit current-thread Chromium (or close BitBrowser window)."""
     TabPool.release_tab()
 
 
