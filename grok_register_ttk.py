@@ -52,6 +52,10 @@ DEFAULT_CONFIG = {
     "bitbrowser_sync_proxy": False,
     "bitbrowser_timeout": 60,
     "bitbrowser_args": [],
+    # fingerprint backend: self-hosted fingerprint (no BitBrowser needed)
+    "fingerprint_profile_root": "",
+    "fingerprint_delete_on_release": True,
+    "fingerprint_user_agents": [],
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -60,6 +64,8 @@ DEFAULT_CONFIG = {
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
+    "grok2api_admin_username": "admin",
+    "grok2api_admin_password": "",
     "grok2api_remote_app_key": "",
     "register_threads": 1,
     "thread_start_interval": 0.8,
@@ -683,68 +689,155 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     return True
 
 
+_GROK2API_ADMIN_TOKEN_CACHE = {"token": "", "expires_at": 0.0, "base": ""}
+
+
+def _grok2api_admin_login(base, username, password, log_callback=None):
+    """POST /api/admin/v1/auth/login -> accessToken. 直连不走代理。"""
+    resp = http_post(
+        f"{base}/api/admin/v1/auth/login",
+        headers={"Content-Type": "application/json"},
+        json={"username": username, "password": password},
+        timeout=10,
+        proxies={},
+    )
+    resp.raise_for_status()
+    payload = resp.json() or {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    tokens = data.get("tokens") or {}
+    access = str(tokens.get("accessToken") or "").strip()
+    if not access:
+        raise RuntimeError(f"login response missing tokens.accessToken: {payload}")
+    expires_at = 0.0
+    raw_exp = str(tokens.get("accessTokenExpiresAt") or "").strip()
+    if raw_exp:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%f%z"):
+            try:
+                from datetime import datetime
+                expires_at = datetime.strptime(raw_exp, fmt).timestamp()
+                break
+            except ValueError:
+                continue
+    _GROK2API_ADMIN_TOKEN_CACHE.update(
+        {"token": access, "expires_at": expires_at, "base": base}
+    )
+    if log_callback:
+        log_callback(f"[+] grok2api 管理员登录成功 ({base}/api/admin/v1/auth/login)")
+    return access
+
+
+def _grok2api_admin_token(base, username, password, log_callback=None):
+    """Return cached accessToken if still valid, otherwise login again."""
+    now = time.time()
+    cached = _GROK2API_ADMIN_TOKEN_CACHE
+    if cached["token"] and cached["base"] == base and (cached["expires_at"] == 0.0 or cached["expires_at"] - now > 30):
+        return cached["token"]
+    return _grok2api_admin_login(base, username, password, log_callback=log_callback)
+
+
 def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
+    """chenyme/grok2api v3: multipart 上传 SSO 文本到 /api/admin/v1/accounts/web/import (SSE)"""
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
     base = str(config.get("grok2api_remote_base", "") or "").strip().rstrip("/")
-    app_key = str(os.environ.get("GROK2API_APP_KEY") or config.get("grok2api_remote_app_key", "") or "").strip()
-    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
-    if not base or not app_key:
+    username = str(config.get("grok2api_admin_username", "admin") or "admin").strip() or "admin"
+    password = (
+        os.environ.get("GROK2API_ADMIN_PASSWORD")
+        or str(config.get("grok2api_admin_password", "") or "").strip()
+        or str(os.environ.get("GROK2API_APP_KEY") or config.get("grok2api_remote_app_key", "") or "").strip()
+    )
+    if not base or not password:
         if log_callback:
-            log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
+            log_callback("[Debug] grok2api 远端未配置 base/admin_password，跳过")
         return False
-    headers = {"Content-Type": "application/json"}
-    query = {"app_key": app_key, "auto_nsfw": "true"}
-    pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
-    remote_pool = pool_map.get(pool_name, "basic")
-    # 优先使用 add 接口，避免全量覆盖远端池
     try:
-        add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
-        resp_add = http_post(
-            f"{base}/tokens/add",
-            headers=headers,
-            params=query,
-            json=add_payload,
-            timeout=8,
+        access = _grok2api_admin_token(base, username, password, log_callback=log_callback)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] grok2api 管理员登录失败: {exc}")
+        return False
+    # curl_cffi 用 CurlMime 走 multipart；服务端 SSE 流式响应，必须 stream=True 读到 complete/error
+    try:
+        from curl_cffi import requests as _cc_requests, CurlMime
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] curl_cffi 不可用: {exc}")
+        return False
+    mime = CurlMime()
+    fname = f"{email or 'sso'}.txt"
+    mime.addpart(name="files", filename=fname, content_type="text/plain", data=f"{token}\n")
+    timeout = float(config.get("grok2api_import_timeout_sec", 60) or 60)
+    try:
+        resp = _cc_requests.post(
+            f"{base}/api/admin/v1/accounts/web/import",
+            headers={"Authorization": f"Bearer {access}"},
+            multipart=mime,
+            timeout=timeout,
             proxies={},
+            stream=True,
         )
-        resp_add.raise_for_status()
+    except Exception as exc:
         if log_callback:
-            log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens/add)")
-        return True
-    except Exception as add_exc:
-        if log_callback:
-            log_callback(f"[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: {add_exc}")
-
-    # 兜底：旧版全量保存接口
-    current = {}
+            log_callback(f"[Debug] grok2api 上传请求失败: {exc}")
+        return False
     try:
-        resp = http_get(f"{base}/tokens", headers=headers, params=query, timeout=6, proxies={})
-        if resp.status_code == 200:
-            payload = resp.json()
-            current = payload.get("tokens", {}) if isinstance(payload, dict) else {}
-    except Exception:
-        current = {}
-    if not isinstance(current, dict):
-        current = {}
-    pool = current.get(pool_name)
-    if not isinstance(pool, list):
-        pool = []
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
-    if token not in existing:
-        pool.append({"token": token, "tags": ["auto-register"], "note": email})
-    current[pool_name] = pool
-    resp2 = http_post(f"{base}/tokens", headers=headers, params=query, json=current, timeout=8, proxies={})
-    resp2.raise_for_status()
-    if log_callback:
-        log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens)")
-    return True
+        if resp.status_code >= 400:
+            body = ""
+            try:
+                body = resp.text[:300]
+            except Exception:
+                pass
+            if log_callback:
+                log_callback(f"[Debug] grok2api /accounts/web/import HTTP {resp.status_code}: {body}")
+            return False
+        # 解析 SSE：event: <name>\n data: <json>；以 complete/error 为终止事件
+        cur_event = ""
+        complete_data = None
+        err_msg = None
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            if line.startswith("event:"):
+                cur_event = line[6:].strip()
+            elif line.startswith("data:"):
+                payload_str = line[5:].strip()
+                if cur_event == "complete":
+                    try:
+                        complete_data = json.loads(payload_str) if payload_str else None
+                    except Exception:
+                        complete_data = None
+                elif cur_event == "error":
+                    try:
+                        err_payload = json.loads(payload_str) if payload_str else {}
+                        err_msg = str(err_payload.get("message") or err_payload.get("code") or payload_str)
+                    except Exception:
+                        err_msg = payload_str
+            if cur_event in ("complete", "error"):
+                break
+        if err_msg:
+            if log_callback:
+                log_callback(f"[Debug] grok2api 远端导入失败: {err_msg}")
+            return False
+        if complete_data is None:
+            if log_callback:
+                log_callback("[Debug] grok2api SSE 未返回 complete 事件")
+            return False
+        created = int(complete_data.get("created") or 0)
+        updated = int(complete_data.get("updated") or 0)
+        skipped = int(complete_data.get("skipped") or 0)
+        if log_callback:
+            log_callback(
+                f"[+] 已写入 grok2api 远端: {base}/api/admin/v1/accounts/web/import "
+                f"(created={created} updated={updated} skipped={skipped})"
+            )
+        return created + updated > 0
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
 
 
 def _add_token_to_grok2api_pools_sync(raw_token, email="", log_callback=None):
@@ -857,11 +950,13 @@ def browser_backend_name() -> str:
     raw = str((config or {}).get("browser_backend") or "chromium").strip().lower()
     if raw in {"bitbrowser", "bit", "bb", "比特", "比特浏览器"}:
         return "bitbrowser"
+    if raw in {"fingerprint", "fp", "指纹", "指纹浏览器", "fpbrowser"}:
+        return "fingerprint"
     return "chromium"
 
 
 def create_managed_browser(log_callback=None):
-    """Create a browser for TabPool: local Chromium or BitBrowser attach."""
+    """Create a browser for TabPool: local Chromium / BitBrowser / fingerprint."""
     backend = browser_backend_name()
     if backend == "bitbrowser":
         from bitbrowser import open_and_attach
@@ -876,6 +971,20 @@ def create_managed_browser(log_callback=None):
 
         browser, _meta = open_and_attach(config, extension_path=ext, log=_log)
         return browser
+
+    if backend == "fingerprint":
+        from fingerprint import create_fingerprint_browser
+
+        ext = EXTENSION_PATH if os.path.exists(EXTENSION_PATH) else None
+
+        def _log(msg):
+            if log_callback:
+                log_callback(msg)
+            else:
+                print(msg)
+
+        worker_id = threading.get_ident() % 10000
+        return create_fingerprint_browser(config, extension_path=ext, log=_log, worker_id=worker_id)
 
     return Chromium(create_browser_options())
 
@@ -2858,9 +2967,18 @@ def _set_page(value):
 def start_browser(log_callback=None):
     last_exc = None
     backend = browser_backend_name()
+    if backend == "fingerprint":
+        def _tab_init_hook(tab, browser):
+            try:
+                from fingerprint import inject_if_present
+                inject_if_present(tab, browser)
+            except Exception:
+                pass
+    else:
+        _tab_init_hook = None
     for attempt in range(1, 5):
         try:
-            # Capture log_callback for BitBrowser factory via closure.
+            # Capture log_callback for BitBrowser / fingerprint factory via closure.
             def _browser_factory(log_callback=log_callback):
                 return create_managed_browser(log_callback=log_callback)
 
@@ -2868,6 +2986,7 @@ def start_browser(log_callback=None):
                 create_browser_options,
                 log_callback=log_callback,
                 browser_factory=_browser_factory,
+                tab_init_hook=_tab_init_hook,
             )
             page = TabPool.get_tab()
             if log_callback:
@@ -4254,19 +4373,29 @@ class GrokRegisterGUI:
         self.grok2api_remote_base_entry = ttk.Entry(config_frame, textvariable=self.grok2api_remote_base_var, width=30)
         self.grok2api_remote_base_entry.grid(row=15, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="grok2api 远端 app_key:").grid(row=16, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="grok2api 管理员用户名:").grid(row=16, column=0, sticky=tk.W)
+        self.grok2api_admin_username_var = tk.StringVar(value=str(config.get("grok2api_admin_username", "admin")))
+        self.grok2api_admin_username_entry = ttk.Entry(config_frame, textvariable=self.grok2api_admin_username_var, width=30)
+        self.grok2api_admin_username_entry.grid(row=16, column=1, columnspan=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="grok2api 管理员密码:").grid(row=17, column=0, sticky=tk.W)
+        self.grok2api_admin_password_var = tk.StringVar(value=str(config.get("grok2api_admin_password", "")))
+        self.grok2api_admin_password_entry = ttk.Entry(config_frame, textvariable=self.grok2api_admin_password_var, width=30, show="*")
+        self.grok2api_admin_password_entry.grid(row=17, column=1, columnspan=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="grok2api 远端 app_key(旧):").grid(row=18, column=0, sticky=tk.W)
         self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
         self.grok2api_remote_key_entry = ttk.Entry(config_frame, textvariable=self.grok2api_remote_key_var, width=30)
-        self.grok2api_remote_key_entry.grid(row=16, column=1, columnspan=3, sticky=tk.W, padx=5)
-        ttk.Label(config_frame, text="默认域名(defaultDomains):").grid(row=17, column=0, sticky=tk.W)
+        self.grok2api_remote_key_entry.grid(row=18, column=1, columnspan=3, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="默认域名(defaultDomains):").grid(row=19, column=0, sticky=tk.W)
         self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
         self.default_domains_entry = ttk.Entry(config_frame, textvariable=self.default_domains_var, width=30)
-        self.default_domains_entry.grid(row=17, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.default_domains_entry.grid(row=19, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="Hotmail账号文件:").grid(row=18, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="Hotmail账号文件:").grid(row=20, column=0, sticky=tk.W)
         self.hotmail_accounts_file_var = tk.StringVar(value=str(config.get("hotmail_accounts_file", "mail_credentials.txt")))
         self.hotmail_accounts_file_entry = ttk.Entry(config_frame, textvariable=self.hotmail_accounts_file_var, width=30)
-        self.hotmail_accounts_file_entry.grid(row=18, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.hotmail_accounts_file_entry.grid(row=20, column=1, columnspan=3, sticky=tk.W, padx=5)
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
         self.start_btn = ttk.Button(btn_frame, text="开始注册", command=self.start_registration)
@@ -4400,9 +4529,10 @@ class GrokRegisterGUI:
 - ssoBasic 或 ssoSuper
 
 12) grok2api 远端自动入池
-- 开启后调用远端管理接口自动加 token
-- 远端 Base 示例: https://xxx/admin/api
-- app_key 按远端服务配置填写
+- 开启后调用 chenyme/grok2api v3 管理 API 自动上传 SSO
+- 远端 Base 示例: http://192.168.x.x:8601 (不带后缀)
+- 填管理员用户名/密码(对应 grok2api config.yaml 的 bootstrapAdmin)
+- SSO 走 POST /api/admin/v1/accounts/web/import,以 Web 账号入库
 
 【最后：快速自检】
 1) 先设置: 注册数量=1，并发线程=1
@@ -4484,6 +4614,8 @@ class GrokRegisterGUI:
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
+        config["grok2api_admin_username"] = self.grok2api_admin_username_var.get().strip() or "admin"
+        config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
         config["defaultDomains"] = self.default_domains_var.get().strip()
         config["hotmail_accounts_file"] = self.hotmail_accounts_file_var.get().strip() or "mail_credentials.txt"

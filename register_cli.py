@@ -525,9 +525,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--browser-backend",
-        choices=["chromium", "bitbrowser"],
+        choices=["chromium", "bitbrowser", "fingerprint"],
         default=None,
-        help="浏览器后端：chromium=本机 Chrome（默认）；bitbrowser=比特浏览器 Local API",
+        help="浏览器后端：chromium=本机 Chrome（默认）；bitbrowser=比特浏览器 Local API；fingerprint=自托管指纹（每号独立 user_data_dir + 随机 UA/screen/tz/WebGL/canvas/audio）",
     )
     parser.add_argument(
         "--bitbrowser-id",

@@ -27,6 +27,7 @@ class TabPool:
 
     _options_factory = None
     _browser_factory: Callable[[], Any] | None = None
+    _tab_init_hook: Callable[[Any, Any], None] | None = None
     _options_lock = threading.Lock()
     _thread_local = threading.local()
     _all_browsers: list[Any] = []
@@ -35,16 +36,22 @@ class TabPool:
     # ── public ──
 
     @classmethod
-    def init(cls, browser_options_or_factory, log_callback=None, browser_factory=None):
+    def init(cls, browser_options_or_factory, log_callback=None, browser_factory=None, tab_init_hook=None):
         """Save options object/factory and optional full browser factory.
 
         browser_factory: () -> Chromium
             When set, used instead of Chromium(options_factory()).
+        tab_init_hook: (tab, browser) -> None
+            Called whenever a new tab is assigned to a thread (get_tab / sync_tab /
+            clear_session). Used by fingerprint backend to re-inject overrides.
         """
         with cls._options_lock:
             if browser_factory is not None and not callable(browser_factory):
                 raise TypeError("browser_factory must be callable")
             cls._browser_factory = browser_factory
+            if tab_init_hook is not None and not callable(tab_init_hook):
+                raise TypeError("tab_init_hook must be callable")
+            cls._tab_init_hook = tab_init_hook
             if browser_options_or_factory is None:
                 cls._options_factory = None
             elif callable(browser_options_or_factory):
@@ -54,7 +61,13 @@ class TabPool:
                 cls._options_factory = lambda: browser_options_or_factory
         if log_callback:
             backend = "custom" if browser_factory else "chromium-options"
-            log_callback(f"[*] TabPool 已初始化浏览器工厂 ({backend})")
+            extras = []
+            if browser_factory:
+                extras.append("browser_factory")
+            if tab_init_hook:
+                extras.append("tab_init_hook")
+            extra = f"+{','.join(extras)}" if extras else ""
+            log_callback(f"[*] TabPool 已初始化浏览器工厂 ({backend}{extra})")
 
     @classmethod
     def _create_browser(cls):
@@ -87,8 +100,18 @@ class TabPool:
                 pass
 
     @classmethod
+    def _apply_tab_init_hook(cls, tab, browser) -> None:
+        hook = cls._tab_init_hook
+        if hook is None or tab is None:
+            return
+        try:
+            hook(tab, browser)
+        except Exception:
+            pass
+
+    @classmethod
     def _dispose_browser(cls, browser, log_callback=None) -> None:
-        """Release one browser instance (BitBrowser-aware)."""
+        """Release one browser instance (BitBrowser / fingerprint aware)."""
         if browser is None:
             return
         if getattr(browser, "_bitbrowser_id", None) or getattr(browser, "_bitbrowser_meta", None):
@@ -96,6 +119,17 @@ class TabPool:
                 from bitbrowser import release_attached
 
                 release_attached(browser, log=log_callback)
+            except Exception:
+                try:
+                    browser.quit()
+                except Exception:
+                    pass
+            return
+        if getattr(browser, "_fingerprint", None):
+            try:
+                from fingerprint import release_fingerprint_browser
+
+                release_fingerprint_browser(browser, log=log_callback)
             except Exception:
                 try:
                     browser.quit()
@@ -129,6 +163,7 @@ class TabPool:
         cls._thread_local.browser = browser
         cls._thread_local.tab = tab
         cls._thread_local.served = 0
+        cls._apply_tab_init_hook(tab, browser)
         return tab
 
     @classmethod
@@ -140,6 +175,7 @@ class TabPool:
         tabs = browser.tab_ids
         if tabs:
             cls._thread_local.tab = browser.get_tab(tabs[-1])
+            cls._apply_tab_init_hook(cls._thread_local.tab, browser)
 
     @classmethod
     def clear_session(cls, log_callback=None) -> bool:
@@ -209,8 +245,10 @@ class TabPool:
                         except Exception:
                             pass
                     cls._thread_local.tab = browser.get_tab(keep)
+                    cls._apply_tab_init_hook(cls._thread_local.tab, browser)
                 elif tabs:
                     cls._thread_local.tab = browser.get_tab(tabs[0])
+                    cls._apply_tab_init_hook(cls._thread_local.tab, browser)
             except Exception:
                 cls.sync_tab()
             if log_callback:
